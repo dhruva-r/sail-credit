@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time
 from typing import Any, Dict, List, Optional
 from zoneinfo import ZoneInfo
@@ -364,6 +364,19 @@ def get_reset_time(timestamp: int) -> int:
     return reset_time.timestamp()
 
 
+def get_reset_day(ts: float):
+    """
+    Returns the 'reset day' (a plain date) that a timestamp belongs to.
+    A reset day starts at 8:00 AM Eastern, so 7:59 AM counts as the previous day.
+    """
+    EASTERN = ZoneInfo("America/New_York")
+    RESET_HOUR = 8
+    local = datetime.fromtimestamp(ts, EASTERN)
+    if local.hour < RESET_HOUR:
+        local -= timedelta(days=1)
+    return local.date()
+
+
 async def get_daily_reward_streak(user_id: int) -> int:
     """
     To be called BEFORE registering today's daily reward.
@@ -374,23 +387,24 @@ async def get_daily_reward_streak(user_id: int) -> int:
     ) as cursor:
         rows = await cursor.fetchall()
 
-        if not rows:
-            return 0
+    if not rows:
+        return 0
 
-        now = int(datetime.now(timezone.utc).timestamp())
-        expected_reset = int(get_reset_time(now)) - 86400  # yesterday's reset timestamp
-        streak = 0
-        for row in rows:
-            row_reset = int(get_reset_time(row["timestamp"]))
-            if row_reset > expected_reset:
-                continue  # skip duplicate entries
-            elif row_reset == expected_reset:
-                streak += 1
-                expected_reset -= 86400
-            else:
-                break
+    today = get_reset_day(datetime.now(timezone.utc).timestamp())
+    expected = today - timedelta(days=1)  # yesterday's reset day
+    streak = 0
 
-        return streak
+    for row in rows:
+        day = get_reset_day(row["timestamp"])
+        if day > expected:
+            continue  # today's claim or duplicate entries
+        elif day == expected:
+            streak += 1
+            expected -= timedelta(days=1)
+        else:
+            break  # gap in the streak
+
+    return streak
 
 
 # --- VCT Betting ---
@@ -413,7 +427,17 @@ async def create_vct_bet(
              amount, odds_at_bet, potential_payout, status, placed_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         """,
-        (discord_id, match_id, team1_name, team2_name, team_pick, amount, odds_at_bet, potential_payout, placed_at),
+        (
+            discord_id,
+            match_id,
+            team1_name,
+            team2_name,
+            team_pick,
+            amount,
+            odds_at_bet,
+            potential_payout,
+            placed_at,
+        ),
     )
     await db.commit()
     return cursor.lastrowid
@@ -500,7 +524,17 @@ async def create_lol_bet(
              amount, odds_at_bet, potential_payout, status, placed_at)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)
         """,
-        (discord_id, match_id, team1_name, team2_name, team_pick, amount, odds_at_bet, potential_payout, placed_at),
+        (
+            discord_id,
+            match_id,
+            team1_name,
+            team2_name,
+            team_pick,
+            amount,
+            odds_at_bet,
+            potential_payout,
+            placed_at,
+        ),
     )
     await db.commit()
     return cursor.lastrowid
