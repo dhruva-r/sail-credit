@@ -755,12 +755,17 @@ async def get_user_pending_ranked_bets(
 
 async def resolve_ranked_bet(
     bet_id: int, status: str, resolved_at: int, match_id: Optional[str]
-) -> None:
-    await db.execute(
-        "UPDATE ranked_bets SET status = ?, resolved_at = ?, match_id = ? WHERE id = ?",
+) -> bool:
+    """
+    Mark a pending bet as resolved. Returns False if it was already resolved, so a bet
+    can never be paid out twice (e.g. a manual refresh racing the poll).
+    """
+    cursor = await db.execute(
+        "UPDATE ranked_bets SET status = ?, resolved_at = ?, match_id = ? WHERE id = ? AND status = 'pending'",
         (status, resolved_at, match_id, bet_id),
     )
     await db.commit()
+    return cursor.rowcount == 1
 
 
 async def get_ranked_betting_leaderboard(game: str) -> List[Dict[str, Any]]:
@@ -780,5 +785,13 @@ async def get_ranked_betting_leaderboard(game: str) -> List[Dict[str, Any]]:
            ORDER BY net_profit DESC
         """,
         (game,),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def get_user_pending_ranked_bets_for_game(discord_id: int, game: str) -> List[Dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM ranked_bets WHERE discord_id = ? AND game = ? AND status = 'pending'",
+        (discord_id, game),
     ) as cursor:
         return await cursor.fetchall()

@@ -1,3 +1,4 @@
+import asyncio
 import time
 from collections import defaultdict
 from dataclasses import dataclass
@@ -15,6 +16,8 @@ POLL_INTERVAL_SECONDS = 120
 BET_EXPIRY_SECONDS = 24 * 3600
 MIN_BET = 10
 MAX_LINKED_ACCOUNTS = 5
+# /refresh checks the API right away, so each user can only use it this often (in seconds)
+REFRESH_COOLDOWN_SECONDS = 60
 
 # Odds are based on the account's win rate in the mode this act/split, smoothed toward 50%
 # as if every account had already played PRIOR_GAMES games at an even record. A new account
@@ -76,6 +79,9 @@ class RankedBettingService:
         self.scheduler = AsyncIOScheduler(timezone="UTC")
         # Called with each BetResolution so the bot can announce it
         self.on_resolution: Optional[Callable] = None
+        self._check_lock = asyncio.Lock()
+        # discord_id -> when they last used /refresh
+        self._last_refresh: Dict[int, float] = {}
 
     async def start(self):
         self.scheduler.add_job(
@@ -167,17 +173,56 @@ class RankedBettingService:
         }
 
     async def _poll(self):
-        """Check every account with pending bets for a ranked game that started after the bet."""
+        """Check every pending bet. Runs on a timer."""
         try:
             pending = await db.get_pending_ranked_bets()
             if not pending:
                 return
+            accounts = await self.check_bets(pending)
+            print(f"Ranked poll: checked {accounts} account(s) with {len(pending)} pending bet(s)")
+        except Exception as e:
+            print(f"Ranked poll error: {e}")
 
+    def refresh_cooldown(self, discord_id: int) -> int:
+        """Seconds until this user can use /refresh again, or 0 if they can now."""
+        last = self._last_refresh.get(discord_id, 0)
+        return max(0, int(last + REFRESH_COOLDOWN_SECONDS - time.monotonic()))
+
+    async def refresh_user_bets(self, discord_id: int, game: str) -> Optional[Dict[str, int]]:
+        """
+        Check one user's pending bets right now instead of waiting for the poll.
+        Returns how many resolved and how many are still pending, or None if on cooldown.
+        """
+        if self.refresh_cooldown(discord_id):
+            return None
+        self._last_refresh[discord_id] = time.monotonic()
+
+        pending = await db.get_user_pending_ranked_bets_for_game(discord_id, game)
+        if pending:
+            await self.check_bets(pending)
+        still_pending = await db.get_user_pending_ranked_bets_for_game(discord_id, game)
+        return {
+            "checked": len(pending),
+            "resolved": len(pending) - len(still_pending),
+            "pending": len(still_pending),
+        }
+
+    async def check_bets(self, pending: List[Dict]) -> int:
+        """
+        Resolve any of these bets whose game has finished. Only one check runs at a time, so a
+        manual refresh waits for an in-progress poll instead of doubling the API calls.
+        Returns how many accounts were checked.
+        """
+        async with self._check_lock:
+            # Another check may have resolved some of these while this one waited for the lock
+            still_pending = {b["id"] for b in await db.get_pending_ranked_bets()}
             bets_by_account = defaultdict(list)
             for bet in pending:
+                if bet["id"] not in still_pending:
+                    continue
                 bets_by_account[(bet["game"], bet["puuid"], bet["region"], bet["mode"])].append(bet)
 
-            # Full game results are large, so each game is only fetched once per poll,
+            # Full game results are large, so each game is only fetched once per check,
             # even if several accounts with bets played in it.
             results: Dict[str, Optional[GameResult]] = {}
             now = int(time.time())
@@ -219,12 +264,7 @@ class RankedBettingService:
                             bet, client, f"No {client.mode(bet['mode']).name} game was played within 24 hours."
                         )
 
-            print(
-                f"Ranked poll: checked {len(bets_by_account)} account(s) "
-                f"with {len(pending)} pending bet(s)"
-            )
-        except Exception as e:
-            print(f"Ranked poll error: {e}")
+            return len(bets_by_account)
 
     async def _resolve(self, bet: Dict, result: GameResult, client: RankedGameClient):
         outcome = result.results[bet["puuid"]]
@@ -235,6 +275,11 @@ class RankedBettingService:
 
         won = outcome == bet["pick"]
         payout = int(bet["potential_payout"]) if won else 0
+        # Claim the bet before paying, so it can't be paid twice
+        if not await db.resolve_ranked_bet(
+            bet["id"], "won" if won else "lost", int(time.time()), result.match_id
+        ):
+            return
         if won:
             user = await db.get_user(bet["discord_id"])
             if user:
@@ -247,9 +292,6 @@ class RankedBettingService:
                     user["sail_credit"] + payout,
                     "RANKED_CREDIT",
                 )
-        await db.resolve_ranked_bet(
-            bet["id"], "won" if won else "lost", int(time.time()), result.match_id
-        )
         await self._announce(bet, client, "won" if won else "lost", payout, result)
 
     async def _refund(
@@ -259,6 +301,11 @@ class RankedBettingService:
         reason: str,
         result: Optional[GameResult] = None,
     ):
+        # Claim the bet before refunding, so it can't be refunded twice
+        if not await db.resolve_ranked_bet(
+            bet["id"], "refunded", int(time.time()), result.match_id if result else None
+        ):
+            return
         user = await db.get_user(bet["discord_id"])
         if user:
             await db.change_and_log_sail_credit(
@@ -270,9 +317,6 @@ class RankedBettingService:
                 user["sail_credit"] + bet["amount"],
                 "RANKED_REFUND",
             )
-        await db.resolve_ranked_bet(
-            bet["id"], "refunded", int(time.time()), result.match_id if result else None
-        )
         await self._announce(bet, client, "refunded", bet["amount"], result, reason)
 
     async def _announce(

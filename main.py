@@ -997,6 +997,36 @@ def _make_ranked_group(game: str, game_name: str) -> app_commands.Group:
         pages = ranked_views.build_user_bets_pages(rows, ranked_service.client(game))
         await interaction.response.send_message(embed=pages[0], view=MessageBook(interaction.user.id, pages))
 
+    @group.command(name="refresh", description=f"Check your pending {game_name} bets right now instead of waiting.")
+    @user_command()
+    async def refresh(interaction: discord.Interaction):
+        if not await ready(interaction):
+            return
+
+        cooldown = ranked_service.refresh_cooldown(interaction.user.id)
+        if cooldown:
+            await interaction.response.send_message(
+                embed=create_embed(message=f"You just refreshed! Try again in **{cooldown}s**."),
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        summary = await ranked_service.refresh_user_bets(interaction.user.id, game)
+        if summary is None or summary["checked"] == 0:
+            message = f"You don't have any pending {game_name} bets."
+        elif summary["resolved"]:
+            message = (
+                f"✅ Resolved **{summary['resolved']}** bet(s) — results were posted where you placed them."
+                + (f"\n⏳ **{summary['pending']}** still waiting on a game." if summary["pending"] else "")
+            )
+        else:
+            message = (
+                f"⏳ Your **{summary['pending']}** pending bet(s) are still waiting on a game. "
+                "Results can take a few minutes to show up after a game ends."
+            )
+        await interaction.followup.send(embed=create_embed(message=message), ephemeral=True)
+
     @group.command(name="leaderboard", description=f"{game_name} betting leaderboard — who's profited the most?")
     @user_command()
     async def leaderboard(interaction: discord.Interaction):
