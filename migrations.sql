@@ -114,3 +114,41 @@ CREATE TABLE
         `placed_at` INTEGER NOT NULL,
         `resolved_at` INTEGER
     );
+
+-- Ranked Betting (Valorant, League)
+-- Riot gives each API its own ID for the same account, so each game's puuid is stored separately.
+-- A game's puuid is NULL if the account has never played that game.
+CREATE TABLE
+    IF NOT EXISTS `riot_accounts` (
+        `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+        `discord_id` INTEGER NOT NULL,
+        `name` TEXT NOT NULL,
+        `tag` TEXT NOT NULL,
+        `valorant_puuid` TEXT UNIQUE,
+        `valorant_region` TEXT,
+        `league_puuid` TEXT UNIQUE,
+        `league_region` TEXT,
+        `linked_at` INTEGER NOT NULL
+    );
+
+CREATE TABLE
+    IF NOT EXISTS `ranked_bets` (
+        `id` INTEGER PRIMARY KEY AUTOINCREMENT,
+        `discord_id` INTEGER NOT NULL,
+        `target_discord_id` INTEGER NOT NULL,
+        `game` TEXT NOT NULL,
+        `mode` TEXT NOT NULL,
+        `puuid` TEXT NOT NULL,
+        `riot_id` TEXT NOT NULL,
+        `region` TEXT NOT NULL,
+        `pick` TEXT NOT NULL,
+        `amount` INTEGER NOT NULL,
+        `odds_at_bet` REAL NOT NULL,
+        `potential_payout` REAL NOT NULL,
+        `status` TEXT DEFAULT 'pending',
+        `placed_at` INTEGER NOT NULL,
+        `counts_from` INTEGER NOT NULL,
+        `resolved_at` INTEGER,
+        `match_id` TEXT,
+        `channel_id` INTEGER
+    );

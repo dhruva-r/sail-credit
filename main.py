@@ -19,6 +19,10 @@ from vct.views import (
 )
 from lol.betting import LoLBettingService, MIN_BET as LOL_MIN_BET
 from lol import views as lol_views
+from ranked.betting import MAX_LINKED_ACCOUNTS, MIN_BET as RANKED_MIN_BET, RankedBettingService
+from ranked.league import LeagueClient, load_riot_key
+from ranked.valorant import ValorantClient, load_henrik_key
+from ranked import views as ranked_views
 import validators
 from datetime import datetime, timedelta
 
@@ -828,6 +832,214 @@ async def lol_leaderboard(interaction: discord.Interaction):
 bot.tree.add_command(lol_group)
 
 
+# --- Ranked Betting (Valorant, League) ---
+
+ranked_service: Optional[RankedBettingService] = None
+
+riot_group = app_commands.Group(name="riot", description="Link your Riot accounts for ranked betting.")
+
+
+@riot_group.command(name="link", description="Link a Riot account so people can bet on its ranked games.")
+@app_commands.describe(riot_id="Your Riot ID, like name#tag")
+@user_command()
+async def riot_link(interaction: discord.Interaction, riot_id: str):
+    if not ranked_service:
+        await interaction.response.send_message(
+            embed=create_embed(message="Ranked betting isn't available right now. Try again in a moment!"),
+            ephemeral=True,
+        )
+        return
+
+    name, sep, tag = riot_id.strip().rpartition("#")
+    name, tag = name.strip(), tag.strip()
+    if not sep or not name or not tag:
+        await interaction.response.send_message(
+            embed=create_embed(message="Enter your Riot ID as **name#tag**, e.g. `pucks in#deep`."),
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Look the account up in every game. Each game's API has its own ID for the same account.
+    found = {}
+    for game, client in ranked_service.clients.items():
+        found[game] = await client.get_account(name, tag)
+    if not any(found.values()):
+        await interaction.followup.send(
+            embed=create_embed(
+                message=f"Couldn't find **{riot_id}** in {' or '.join(c.game_name for c in ranked_service.clients.values())}. Check the spelling and tag!"
+            ),
+            ephemeral=True,
+        )
+        return
+
+    account_name = next(a for a in found.values() if a)
+    ids = {
+        "valorant_puuid": found["valorant"].puuid if found.get("valorant") else None,
+        "valorant_region": found["valorant"].region if found.get("valorant") else None,
+        "league_puuid": found["league"].puuid if found.get("league") else None,
+        "league_region": found["league"].region if found.get("league") else None,
+    }
+    games_text = " and ".join(ranked_service.clients[g].game_name for g, a in found.items() if a)
+
+    existing = await db.find_riot_account_by_puuid(ids["valorant_puuid"], ids["league_puuid"])
+    if existing:
+        if existing["discord_id"] != interaction.user.id:
+            await interaction.followup.send(
+                embed=create_embed(message=f"**{riot_id}** is already linked to <@{existing['discord_id']}>."),
+                ephemeral=True,
+            )
+            return
+        # Already theirs. Refresh the name, and pick up a game they've started playing since.
+        await db.update_riot_account(existing["id"], account_name.name, account_name.tag, **ids)
+        await interaction.followup.send(
+            embed=create_embed(message=f"**{account_name.name}#{account_name.tag}** is already linked to you ({games_text})."),
+            ephemeral=True,
+        )
+        return
+
+    linked = await db.get_user_riot_accounts(interaction.user.id)
+    if len(linked) >= MAX_LINKED_ACCOUNTS:
+        await interaction.followup.send(
+            embed=create_embed(
+                message=f"You can link up to **{MAX_LINKED_ACCOUNTS}** accounts. Use `/riot unlink` to remove one first."
+            ),
+            ephemeral=True,
+        )
+        return
+
+    await db.link_riot_account(
+        interaction.user.id, account_name.name, account_name.tag, linked_at=int(time.time()), **ids
+    )
+    await interaction.followup.send(
+        embed=create_embed(
+            message=f"✅ Linked **{account_name.name}#{account_name.tag}** ({games_text}). People can now bet on its ranked games!",
+            color=0x61B875,
+        ),
+        ephemeral=True,
+    )
+
+
+@riot_group.command(name="unlink", description="Unlink one of your Riot accounts.")
+@app_commands.describe(account="The linked account to remove")
+@user_command()
+async def riot_unlink(interaction: discord.Interaction, account: str):
+    accounts = await db.get_user_riot_accounts(interaction.user.id)
+    match = next(
+        (a for a in accounts if str(a["id"]) == account or f"{a['name']}#{a['tag']}".lower() == account.strip().lower()),
+        None,
+    )
+    if not match:
+        await interaction.response.send_message(
+            embed=create_embed(message=f"You don't have **{account}** linked. Check `/riot accounts`."),
+            ephemeral=True,
+        )
+        return
+
+    # Pending bets keep their own copy of the account, so they still resolve after an unlink
+    await db.unlink_riot_account(match["id"])
+    await interaction.response.send_message(
+        embed=create_embed(message=f"Unlinked **{match['name']}#{match['tag']}**."),
+        ephemeral=True,
+    )
+
+
+@riot_unlink.autocomplete("account")
+async def riot_unlink_autocomplete(interaction: discord.Interaction, current: str):
+    accounts = await db.get_user_riot_accounts(interaction.user.id)
+    choices = []
+    for a in accounts:
+        name = f"{a['name']}#{a['tag']}"
+        if current.lower() in name.lower():
+            choices.append(app_commands.Choice(name=name[:100], value=str(a["id"])))
+    return choices[:25]
+
+
+@riot_group.command(name="accounts", description="See linked Riot accounts.")
+@app_commands.describe(player="Whose accounts to show (default: everyone)")
+@user_command()
+async def riot_accounts(interaction: discord.Interaction, player: Optional[discord.Member] = None):
+    accounts = await db.get_user_riot_accounts(player.id) if player else await db.get_all_riot_accounts()
+    await interaction.response.send_message(embed=ranked_views.build_accounts_embed(accounts, player))
+
+
+bot.tree.add_command(riot_group)
+
+
+def _make_ranked_group(game: str, game_name: str) -> app_commands.Group:
+    """Build the /valorant or /league command group. Both work the same way."""
+    group = app_commands.Group(name=game, description=f"Bet on each other's {game_name} ranked games!")
+
+    async def ready(interaction: discord.Interaction) -> bool:
+        if ranked_service and ranked_service.client(game):
+            return True
+        await interaction.response.send_message(
+            embed=create_embed(message=f"{game_name} betting isn't available right now. Try again in a moment!"),
+            ephemeral=True,
+        )
+        return False
+
+    @group.command(name="bet", description=f"Bet on whether someone wins or loses their next {game_name} ranked game.")
+    @app_commands.describe(player="Only show this player's accounts (optional)")
+    @user_command()
+    async def bet(interaction: discord.Interaction, player: Optional[discord.Member] = None):
+        if not await ready(interaction):
+            return
+        await ranked_views.RankedBetView.send(interaction, ranked_service, game, RANKED_MIN_BET, player)
+
+    @group.command(name="bets", description=f"View your {game_name} betting history.")
+    @user_command()
+    async def bets(interaction: discord.Interaction):
+        if not await ready(interaction):
+            return
+        rows = await db.get_user_ranked_bets(interaction.user.id, game)
+        pages = ranked_views.build_user_bets_pages(rows, ranked_service.client(game))
+        await interaction.response.send_message(embed=pages[0], view=MessageBook(interaction.user.id, pages))
+
+    @group.command(name="leaderboard", description=f"{game_name} betting leaderboard — who's profited the most?")
+    @user_command()
+    async def leaderboard(interaction: discord.Interaction):
+        title = f"🏆 {game_name} Betting Leaderboard"
+        rows = await db.get_ranked_betting_leaderboard(game)
+        if not rows:
+            await interaction.response.send_message(embed=create_embed(title=title, message="No resolved bets yet!"))
+            return
+
+        lines = []
+        for i, row in enumerate(rows[:15]):
+            net = int(row["net_profit"])
+            sign = "+" if net >= 0 else ""
+            lines.append(
+                f"**#{i + 1}** <@{row['discord_id']}> — {sign}{net} SSC "
+                f"({row['wins']}W/{row['losses']}L, {int(row['total_wagered'])} wagered)"
+            )
+        await interaction.response.send_message(embed=create_embed(title=title, message="\n".join(lines)))
+
+    return group
+
+
+bot.tree.add_command(_make_ranked_group("valorant", "Valorant"))
+bot.tree.add_command(_make_ranked_group("league", "League"))
+
+
+async def announce_ranked_resolution(resolution):
+    """Post a resolved bet in the channel it was placed in."""
+    if not resolution.channel_id:
+        return
+    channel = bot.get_channel(resolution.channel_id)
+    if not channel:
+        try:
+            channel = await bot.fetch_channel(resolution.channel_id)
+        except discord.HTTPException:
+            return
+    await channel.send(
+        content=f"<@{resolution.bettor_id}>",
+        embed=ranked_views.create_resolution_embed(resolution),
+        allowed_mentions=discord.AllowedMentions(users=[discord.Object(resolution.bettor_id)]),
+    )
+
+
 @bot.tree.command(
     name="beg",
     description="Request a top up to your balance.",
@@ -963,6 +1175,25 @@ async def on_ready():
     global lol_service
     lol_service = LoLBettingService()
     await lol_service.start()
+
+    # on_ready can fire again on reconnect. Only start one poller, since it shares the API rate limits.
+    global ranked_service
+    if not ranked_service:
+        clients = []
+        henrik_key = load_henrik_key()
+        if henrik_key:
+            clients.append(ValorantClient(henrik_key))
+        else:
+            print("No HenrikDev API key (henrik_token file or HENRIK_API_KEY) — Valorant betting disabled.")
+        riot_key = load_riot_key()
+        if riot_key:
+            clients.append(LeagueClient(riot_key))
+        else:
+            print("No Riot API key (riot_token file or RIOT_API_KEY) — League betting disabled.")
+        if clients:
+            ranked_service = RankedBettingService(clients)
+            ranked_service.on_resolution = announce_ranked_resolution
+            await ranked_service.start()
 
     await bot.tree.sync()
 

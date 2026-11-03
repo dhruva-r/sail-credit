@@ -599,3 +599,186 @@ async def get_user_pending_lol_bets_for_match(
         (discord_id, match_id),
     ) as cursor:
         return await cursor.fetchall()
+
+
+# --- Ranked Betting (Valorant, League) ---
+
+
+async def link_riot_account(
+    discord_id: int,
+    name: str,
+    tag: str,
+    valorant_puuid: Optional[str],
+    valorant_region: Optional[str],
+    league_puuid: Optional[str],
+    league_region: Optional[str],
+    linked_at: int,
+) -> int:
+    cursor = await db.execute(
+        """INSERT INTO riot_accounts
+            (discord_id, name, tag, valorant_puuid, valorant_region, league_puuid, league_region, linked_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+        (discord_id, name, tag, valorant_puuid, valorant_region, league_puuid, league_region, linked_at),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def update_riot_account(
+    account_id: int,
+    name: str,
+    tag: str,
+    valorant_puuid: Optional[str],
+    valorant_region: Optional[str],
+    league_puuid: Optional[str],
+    league_region: Optional[str],
+) -> None:
+    """Refresh a linked account, e.g. after a name change or after it starts playing the other game."""
+    await db.execute(
+        """UPDATE riot_accounts SET name = ?, tag = ?,
+               valorant_puuid = COALESCE(?, valorant_puuid), valorant_region = COALESCE(?, valorant_region),
+               league_puuid = COALESCE(?, league_puuid), league_region = COALESCE(?, league_region)
+           WHERE id = ?""",
+        (name, tag, valorant_puuid, valorant_region, league_puuid, league_region, account_id),
+    )
+    await db.commit()
+
+
+async def unlink_riot_account(account_id: int) -> None:
+    await db.execute("DELETE FROM riot_accounts WHERE id = ?", (account_id,))
+    await db.commit()
+
+
+async def get_riot_account(account_id: int) -> Optional[Dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM riot_accounts WHERE id = ?", (account_id,)
+    ) as cursor:
+        return await cursor.fetchone()
+
+
+async def find_riot_account_by_puuid(
+    valorant_puuid: Optional[str], league_puuid: Optional[str]
+) -> Optional[Dict[str, Any]]:
+    """Find an already-linked account by either game's ID."""
+    async with db.execute(
+        "SELECT * FROM riot_accounts WHERE valorant_puuid = ? OR league_puuid = ?",
+        (valorant_puuid, league_puuid),
+    ) as cursor:
+        return await cursor.fetchone()
+
+
+async def get_user_riot_accounts(discord_id: int) -> List[Dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM riot_accounts WHERE discord_id = ? ORDER BY linked_at",
+        (discord_id,),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def get_all_riot_accounts(game: Optional[str] = None) -> List[Dict[str, Any]]:
+    """All linked accounts, or only those that have played `game` ("valorant" or "league")."""
+    query = "SELECT * FROM riot_accounts"
+    if game in ("valorant", "league"):
+        query += f" WHERE {game}_puuid IS NOT NULL"
+    async with db.execute(query + " ORDER BY discord_id, linked_at") as cursor:
+        return await cursor.fetchall()
+
+
+async def create_ranked_bet(
+    discord_id: int,
+    target_discord_id: int,
+    game: str,
+    mode: str,
+    puuid: str,
+    riot_id: str,
+    region: str,
+    pick: str,
+    amount: int,
+    odds_at_bet: float,
+    potential_payout: float,
+    placed_at: int,
+    counts_from: int,
+    channel_id: Optional[int],
+) -> int:
+    cursor = await db.execute(
+        """INSERT INTO ranked_bets
+            (discord_id, target_discord_id, game, mode, puuid, riot_id, region, pick, amount,
+             odds_at_bet, potential_payout, status, placed_at, counts_from, channel_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?, ?)
+        """,
+        (
+            discord_id,
+            target_discord_id,
+            game,
+            mode,
+            puuid,
+            riot_id,
+            region,
+            pick,
+            amount,
+            odds_at_bet,
+            potential_payout,
+            placed_at,
+            counts_from,
+            channel_id,
+        ),
+    )
+    await db.commit()
+    return cursor.lastrowid
+
+
+async def get_user_ranked_bets(discord_id: int, game: str) -> List[Dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM ranked_bets WHERE discord_id = ? AND game = ? ORDER BY placed_at DESC",
+        (discord_id, game),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def get_pending_ranked_bets() -> List[Dict[str, Any]]:
+    async with db.execute(
+        "SELECT * FROM ranked_bets WHERE status = 'pending' ORDER BY placed_at"
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def get_user_pending_ranked_bets(
+    discord_id: int, game: str, puuid: str, mode: str
+) -> List[Dict[str, Any]]:
+    async with db.execute(
+        """SELECT * FROM ranked_bets
+           WHERE discord_id = ? AND game = ? AND puuid = ? AND mode = ? AND status = 'pending'""",
+        (discord_id, game, puuid, mode),
+    ) as cursor:
+        return await cursor.fetchall()
+
+
+async def resolve_ranked_bet(
+    bet_id: int, status: str, resolved_at: int, match_id: Optional[str]
+) -> None:
+    await db.execute(
+        "UPDATE ranked_bets SET status = ?, resolved_at = ?, match_id = ? WHERE id = ?",
+        (status, resolved_at, match_id, bet_id),
+    )
+    await db.commit()
+
+
+async def get_ranked_betting_leaderboard(game: str) -> List[Dict[str, Any]]:
+    """Get users ranked by net ranked betting profit for one game."""
+    async with db.execute(
+        """SELECT
+               discord_id,
+               SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END) as total_won,
+               SUM(amount) as total_wagered,
+               SUM(CASE WHEN status = 'won' THEN potential_payout ELSE 0 END) - SUM(amount) as net_profit,
+               COUNT(*) as total_bets,
+               SUM(CASE WHEN status = 'won' THEN 1 ELSE 0 END) as wins,
+               SUM(CASE WHEN status = 'lost' THEN 1 ELSE 0 END) as losses
+           FROM ranked_bets
+           WHERE game = ? AND status IN ('won', 'lost')
+           GROUP BY discord_id
+           ORDER BY net_profit DESC
+        """,
+        (game,),
+    ) as cursor:
+        return await cursor.fetchall()

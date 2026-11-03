@@ -172,3 +172,8 @@ config.py
 
 # state
 state.json
+
+# HenrikDev Valorant API key
+henrik_token
+# Riot Games API key
+riot_token
