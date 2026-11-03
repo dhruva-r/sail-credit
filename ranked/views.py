@@ -20,10 +20,12 @@ def _record_text(odds: "Odds", mode_name: str) -> str:
     record = odds.record
     if not record:
         return "Couldn't load stats — using even odds"
+    # Unranked queues (ARAM) have no rank, so their record has no rank to show
+    prefix = f"{record.rank} · " if record.rank else ""
     if record.games == 0:
-        return f"{record.rank} · No {mode_name} games this season yet"
+        return f"{prefix}No recent {mode_name} games — even odds"
     return (
-        f"{record.rank} · {record.wins}W / {record.games} {mode_name} games "
+        f"{prefix}{record.wins}W / {record.games} {mode_name} games "
         f"({round(100 * record.wins / record.games)}%)"
     )
 
@@ -124,7 +126,7 @@ class RankedBetView(discord.ui.View):
         self.add_item(self.account_select)
 
         if self.selected and len(self.client.modes) > 1:
-            self.mode_select = discord.ui.Select(placeholder="Select a ranked mode...", row=1)
+            self.mode_select = discord.ui.Select(placeholder="Select a mode...", row=1)
             self.mode_select.callback = self.select_mode
             for mode in self.client.modes:
                 self.mode_select.options.append(
@@ -165,7 +167,7 @@ class RankedBetView(discord.ui.View):
         if not self.mode or not self.odds:
             return create_embed(
                 title=f"{title} — {_riot_id(account)}",
-                message=f"{header}\n\nPick a ranked mode below.\n\nYour balance: **{self.balance} SSC**",
+                message=f"{header}\n\nPick a mode below.\n\nYour balance: **{self.balance} SSC**",
             )
 
         mode_name = self.client.mode(self.mode).name

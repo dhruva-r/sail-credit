@@ -20,11 +20,22 @@ RIOT_TOKEN_FILE = "riot_token"
 # Stay a little under both.
 RIOT_RATE_LIMITS = [(18, 1), (90, 120)]
 
-# mode key -> (match-v5 queue ID, league-v4 queueType)
+# mode key -> (match-v5 queue ID, league-v4 queueType). Unranked queues have no queueType,
+# since Riot only keeps a win/loss record for ranked queues.
 LEAGUE_QUEUES = {
     "solo": (420, "RANKED_SOLO_5x5"),
     "flex": (440, "RANKED_FLEX_SR"),
+    "aram": (450, None),
+    "mayhem": (2400, None),
 }
+
+# For unranked queues, the win rate comes from this many recent games. Each one is a match
+# lookup, so this is kept small for the development key's 100 requests per 2 minutes.
+UNRANKED_SAMPLE_GAMES = 10
+# How long an unranked record is reused before it's recalculated (in seconds)
+UNRANKED_RECORD_TTL = 30 * 60
+# Max finished game results kept in memory
+RESULT_CACHE_SIZE = 500
 
 # Platform (where the account plays, e.g. na1) -> regional routing host for account and match data
 PLATFORM_TO_REGION = {
@@ -67,11 +78,20 @@ class LeagueClient(RankedGameClient):
 
     game_key = "league"
     game_name = "League"
-    modes = [RankedMode("solo", "Ranked Solo/Duo"), RankedMode("flex", "Ranked Flex")]
+    modes = [
+        RankedMode("solo", "Ranked Solo/Duo"),
+        RankedMode("flex", "Ranked Flex"),
+        RankedMode("aram", "ARAM"),
+        RankedMode("mayhem", "ARAM Mayhem"),
+    ]
 
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.rate_limiter = RateLimiter(RIOT_RATE_LIMITS)
+        # Finished games never change, so results are cached for the unranked win rate and the poll
+        self._results: Dict[str, GameResult] = {}
+        # (puuid, mode) -> (when it was calculated, record)
+        self._unranked_records: Dict[tuple, tuple] = {}
 
     async def _get(
         self, host: str, path: str, params: Optional[Dict[str, Any]] = None
@@ -117,7 +137,13 @@ class LeagueClient(RankedGameClient):
         )
 
     async def get_record(self, puuid: str, region: str, mode: str) -> Optional[RankedRecord]:
-        """Wins and games in this queue for the current split. Unranked this split gets 0/0."""
+        """
+        Wins and games in this queue. Ranked queues use the current split's record. Unranked queues
+        (ARAM) use the last few games, since Riot doesn't track a record for them.
+        """
+        if LEAGUE_QUEUES[mode][1] is None:
+            return await self._get_unranked_record(puuid, region, mode)
+
         entries = await self._get(region, f"/lol/league/v4/entries/by-puuid/{puuid}")
         if entries is None:
             return None
@@ -135,6 +161,34 @@ class LeagueClient(RankedGameClient):
                     rank=f"{tier}{division} {entry.get('leaguePoints', 0)} LP",
                 )
         return RankedRecord(wins=0, games=0, rank="Unranked")
+
+    async def _get_unranked_record(self, puuid: str, region: str, mode: str) -> Optional[RankedRecord]:
+        """Win rate over the last UNRANKED_SAMPLE_GAMES games in an unranked queue."""
+        cached = self._unranked_records.get((puuid, mode))
+        if cached and time.monotonic() - cached[0] < UNRANKED_RECORD_TTL:
+            return cached[1]
+
+        match_ids = await self._get(
+            _region_for(region),
+            f"/lol/match/v5/matches/by-puuid/{puuid}/ids",
+            {"queue": LEAGUE_QUEUES[mode][0], "count": UNRANKED_SAMPLE_GAMES},
+        )
+        if match_ids is None:
+            return None
+
+        wins = games = 0
+        for match_id in match_ids:
+            result = await self.get_game_result(match_id, region)
+            # Remakes don't say anything about how good someone is, so they're skipped
+            if not result or result.results.get(puuid) not in ("win", "loss"):
+                continue
+            games += 1
+            wins += result.results[puuid] == "win"
+
+        # No rank for unranked queues. The slip shows "6W / 10 ARAM games", from the last 10.
+        record = RankedRecord(wins=wins, games=games, rank="")
+        self._unranked_records[(puuid, mode)] = (time.monotonic(), record)
+        return record
 
     async def get_recent_games(
         self, puuid: str, region: str, mode: str, since: int
@@ -154,6 +208,17 @@ class LeagueClient(RankedGameClient):
         return [RecentGame(match_id=m, started_at=0) for m in match_ids]
 
     async def get_game_result(self, match_id: str, region: str) -> Optional[GameResult]:
+        if match_id in self._results:
+            return self._results[match_id]
+        result = await self._fetch_game_result(match_id, region)
+        if result:
+            # Only finished games are returned, and those never change, so they're safe to keep
+            self._results[match_id] = result
+            if len(self._results) > RESULT_CACHE_SIZE:
+                del self._results[next(iter(self._results))]
+        return result
+
+    async def _fetch_game_result(self, match_id: str, region: str) -> Optional[GameResult]:
         data = await self._get(_region_for(region), f"/lol/match/v5/matches/{match_id}")
         if not data:
             return None

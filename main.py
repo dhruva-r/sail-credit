@@ -969,7 +969,7 @@ bot.tree.add_command(riot_group)
 
 def _make_ranked_group(game: str, game_name: str) -> app_commands.Group:
     """Build the /valorant or /league command group. Both work the same way."""
-    group = app_commands.Group(name=game, description=f"Bet on each other's {game_name} ranked games!")
+    group = app_commands.Group(name=game, description=f"Bet on each other's {game_name} games!")
 
     async def ready(interaction: discord.Interaction) -> bool:
         if ranked_service and ranked_service.client(game):
@@ -980,7 +980,7 @@ def _make_ranked_group(game: str, game_name: str) -> app_commands.Group:
         )
         return False
 
-    @group.command(name="bet", description=f"Bet on whether someone wins or loses their next {game_name} ranked game.")
+    @group.command(name="bet", description=f"Bet on whether someone wins or loses their next {game_name} game.")
     @app_commands.describe(player="Only show this player's accounts (optional)")
     @user_command()
     async def bet(interaction: discord.Interaction, player: Optional[discord.Member] = None):
